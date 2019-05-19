@@ -1,45 +1,182 @@
+import json
 import time
 
 import backoff
 import requests
+from cashier import cache
 
+from helpers.misc import backoff_handler, dict_merge
+from helpers.trakt import extract_list_user_and_key_from_url
 from misc.log import logger
 
 log = logger.get_logger(__name__)
 
 
-def backoff_handler(details):
-    log.warning("Backing off {wait:0.1f} seconds afters {tries} tries "
-                "calling function {target} with args {args} and kwargs "
-                "{kwargs}".format(**details))
-
-
 class Trakt:
-    non_user_lists = ['anticipated', 'trending', 'popular', 'boxoffice']
+    non_user_lists = ['anticipated', 'trending', 'popular', 'boxoffice', 'watched', 'played']
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.client_id = cfg.trakt.client_id
-        self.client_secret = cfg.trakt.client_secret
-        self.headers = {
-            'Content-Type': 'application/json',
-            'trakt-api-version': '2',
-            'trakt-api-key': self.client_id
-        }
+
+    ############################################################
+    # Requests
+    ############################################################
+
+    def _make_request(self, url, payload={}, authenticate_user=None, request_type='get'):
+        headers, authenticate_user = self._headers(authenticate_user)
+        headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' \
+                                '(KHTML, like Gecko) Chrome/71.0.3578.80 Safari/537.36'
+
+        if authenticate_user:
+            url = url.replace('{authenticate_user}', authenticate_user)
+
+        # make request
+        resp_data = ''
+        if request_type == 'delete':
+            with requests.delete(url, headers=headers, params=payload, timeout=30, stream=True) as req:
+                for chunk in req.iter_content(chunk_size=250000, decode_unicode=True):
+                    if chunk:
+                        resp_data += chunk
+        else:
+            with requests.get(url, headers=headers, params=payload, timeout=30, stream=True) as req:
+                for chunk in req.iter_content(chunk_size=250000, decode_unicode=True):
+                    if chunk:
+                        resp_data += chunk
+
+        log.debug("Request URL: %s", req.url)
+        log.debug("Request Payload: %s", payload)
+        log.debug("Request User: %s", authenticate_user)
+        log.debug("Response Code: %d", req.status_code)
+        return req, resp_data
+
+    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
+    def _make_item_request(self, url, object_name, payload={}):
+        payload = dict_merge(payload, {'extended': 'full'})
+
+        try:
+            req, resp_data = self._make_request(url, payload)
+
+            if req.status_code == 200 and len(resp_data):
+                resp_json = json.loads(resp_data)
+                return resp_json
+            elif req.status_code == 401:
+                log.error("The authentication to Trakt is revoked. Please re-authenticate.")
+                exit()
+            else:
+                log.error("Failed to retrieve %s, request response: %d", object_name, req.status_code)
+                return None
+        except Exception:
+            log.exception("Exception retrieving %s: ", object_name)
+        return None
+
+    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=6, on_backoff=backoff_handler)
+    def _make_items_request(self, url, limit, languages, type_name, object_name, authenticate_user=None, payload={},
+                            sleep_between=5, genres=None):
+        if not languages:
+            languages = ['en']
+
+        payload = dict_merge(payload, {'extended': 'full', 'limit': limit, 'page': 1, 'languages': ','.join(languages)})
+        if genres:
+            payload['genres'] = genres
+
+        processed = []
+
+        if authenticate_user:
+            type_name = type_name.replace('{authenticate_user}', self._user_used_for_authentication(authenticate_user))
+
+        try:
+            resp_data = ''
+            while True:
+                attempts = 0
+                max_attempts = 6
+                retrieve_error = False
+                while attempts <= max_attempts:
+                    try:
+                        req, resp_data = self._make_request(url, payload, authenticate_user)
+                        if resp_data is not None:
+                            retrieve_error = False
+                            break
+                        else:
+                            log.warning("Failed to retrieve valid response for Trakt %s %s from _make_item_request",
+                                        type_name, object_name)
+
+                    except Exception:
+                        log.exception("Exception retrieving %s %s in _make_item_request: ", type_name, object_name)
+                        retrieve_error = True
+
+                    attempts += 1
+                    log.info("Sleeping for %d seconds before making attempt %d/%d", 3 * attempts, attempts + 1,
+                             max_attempts)
+                    time.sleep(3 * attempts)
+
+                if retrieve_error or not resp_data or not len(resp_data):
+                    log.error("Failed retrieving %s %s from _make_item_request %d times, aborting...", type_name,
+                              object_name, attempts)
+                    return None
+
+                current_page = payload['page']
+                total_pages = 0 if 'X-Pagination-Page-Count' not in req.headers else int(
+                    req.headers['X-Pagination-Page-Count'])
+
+                log.debug("Response Page: %d of %d", current_page, total_pages)
+
+                if req.status_code == 200 and len(resp_data):
+                    if resp_data.startswith("[{") and resp_data.endswith("}]"):
+                        resp_json = json.loads(resp_data)
+
+                        if type_name == 'person' and 'cast' in resp_json:
+                            # handle person results
+                            for item in resp_json['cast']:
+                                if item not in processed:
+                                    if object_name.rstrip('s') not in item and 'title' in item:
+                                        processed.append({object_name.rstrip('s'): item})
+                                    else:
+                                        processed.append(item)
+                        else:
+                            for item in resp_json:
+                                if item not in processed:
+                                    if object_name.rstrip('s') not in item and 'title' in item:
+                                        processed.append({object_name.rstrip('s'): item})
+                                    else:
+                                        processed.append(item)
+
+                    else:
+                        log.warning("Received malformed JSON response for page: %d of %d", current_page, total_pages)
+
+                    # check if we have fetched the last page, break if so
+                    if total_pages == 0:
+                        log.debug("There were no more pages to retrieve")
+                        break
+                    elif current_page >= total_pages:
+                        log.debug("There are no more pages to retrieve results from")
+                        break
+                    else:
+                        log.info("There are %d pages left to retrieve results from", total_pages - current_page)
+                        payload['page'] += 1
+                        time.sleep(sleep_between)
+
+                elif req.status_code == 401:
+                    log.error("The authentication to Trakt is revoked. Please re-authenticate.")
+                    exit()
+                else:
+                    log.error("Failed to retrieve %s %s, request response: %d", type_name, object_name, req.status_code)
+                    break
+
+            if len(processed):
+                log.debug("Found %d %s %s", len(processed), type_name, object_name)
+                return processed
+
+            return None
+        except Exception:
+            log.exception("Exception retrieving %s %s: ", type_name, object_name)
+        return None
 
     def validate_client_id(self):
         try:
-            # request trending shows to determine if client_id is valid
-            payload = {'extended': 'full', 'limit': 1000}
-
-            # make request
-            req = requests.get(
-                'https://api.trakt.tv/shows/anticipated',
-                headers=self.headers,
-                params=payload,
-                timeout=30
+            # request anticipated shows to validate client_id
+            req, req_data = self._make_request(
+                url='https://api.trakt.tv/shows/anticipated',
             )
-            log.debug("Request Response: %d", req.status_code)
 
             if req.status_code == 200:
                 return True
@@ -48,17 +185,30 @@ class Trakt:
             log.exception("Exception validating client_id: ")
         return False
 
+    def remove_recommended_item(self, item_type, trakt_id, authenticate_user=None):
+        ret, ret_data = self._make_request(
+            url='https://api.trakt.tv/recommendations/%ss/%s' % (item_type, str(trakt_id)),
+            authenticate_user=authenticate_user,
+            request_type='delete'
+        )
+        if ret.status_code == 204:
+            return True
+        return False
+
     ############################################################
-    # OAuth Authentication Initialisation
+    # OAuth Authentication
     ############################################################
 
     def __oauth_request_device_code(self):
         log.info("We're talking to Trakt to get your verification code. Please wait a moment...")
 
-        payload = {'client_id': self.client_id}
+        payload = {'client_id': self.cfg.trakt.client_id}
+
+        print(self._headers_without_authentication())
 
         # Request device code
-        req = requests.post('https://api.trakt.tv/oauth/device/code', params=payload, headers=self.headers)
+        req = requests.post('https://api.trakt.tv/oauth/device/code', params=payload,
+                            headers=self._headers_without_authentication())
         device_code_response = req.json()
 
         # Display needed information to the user
@@ -77,7 +227,7 @@ class Trakt:
             access_token = access_token_response['access_token']
 
             # But first we need to find out what user this token belongs to
-            temp_headers = self.headers
+            temp_headers = self._headers_without_authentication()
             temp_headers['Authorization'] = 'Bearer ' + access_token
 
             req = requests.get('https://api.trakt.tv/users/me', headers=temp_headers)
@@ -117,11 +267,12 @@ class Trakt:
             log.debug('Polling Trakt for the %sth time; %s seconds left', tries,
                       polling_expire - round(time.time() - polling_start))
 
-            payload = {'code': device_code, 'client_id': self.client_id, 'client_secret': self.client_secret,
-                       'grant_type': 'authorization_code'}
+            payload = {'code': device_code, 'client_id': self.cfg.trakt.client_id,
+                       'client_secret': self.cfg.trakt.client_secret, 'grant_type': 'authorization_code'}
 
             # Poll Trakt for access token
-            req = requests.post('https://api.trakt.tv/oauth/device/token', params=payload, headers=self.headers)
+            req = requests.post('https://api.trakt.tv/oauth/device/token', params=payload,
+                                headers=self._headers_without_authentication())
 
             success, status_code = self.__oauth_process_token_request(req)
 
@@ -135,10 +286,11 @@ class Trakt:
         return False
 
     def __oauth_refresh_access_token(self, refresh_token):
-        payload = {'refresh_token': refresh_token, 'client_id': self.client_id, 'client_secret': self.client_secret,
-                   'grant_type': 'refresh_token'}
+        payload = {'refresh_token': refresh_token, 'client_id': self.cfg.trakt.client_id,
+                   'client_secret': self.cfg.trakt.client_secret, 'grant_type': 'refresh_token'}
 
-        req = requests.post('https://api.trakt.tv/oauth/token', params=payload, headers=self.headers)
+        req = requests.post('https://api.trakt.tv/oauth/token', params=payload,
+                            headers=self._headers_without_authentication())
 
         success, status_code = self.__oauth_process_token_request(req)
 
@@ -156,49 +308,63 @@ class Trakt:
             log.exception("Exception occurred when authenticating user")
         return False
 
-    def oauth_headers(self, user):
-        headers = self.headers
+    def _get_first_authenticated_user(self):
+        import copy
 
-        if user is None:
-            users = self.cfg['trakt']
+        users = copy.copy(self.cfg.trakt)
 
-            if 'client_id' in users.keys():
-                users.pop('client_id')
+        if 'client_id' in users.keys():
+            users.pop('client_id')
 
-            if 'client_secret' in users.keys():
-                users.pop('client_secret')
+        if 'client_secret' in users.keys():
+            users.pop('client_secret')
 
-            if len(users) > 0:
-                user = list(users.keys())[0]
+        if len(users) > 0:
+            return list(users.keys())[0]
 
-                log.debug('No user provided, so default to the first user in the config (%s)', user)
-        elif user not in self.cfg['trakt'].keys():
-            log.error(
-                'The user %s you specified to use for authentication is not authenticated yet. '
-                'Authenticate the user first, before you use it to retrieve lists.',
-                user)
+    def _user_is_authenticated(self, user):
+        return user in self.cfg['trakt'].keys()
 
-            exit()
-
-        # If there is no default user, try without authentication
-        if user is None:
-            log.info('Using no authentication')
-
-            return headers, user
-
+    def _renew_oauth_token_if_expired(self, user):
         token_information = self.cfg['trakt'][user]
+
         # Check if the acces_token for the user is expired
         expires_at = token_information['created_at'] + token_information['expires_in']
-
         if expires_at < round(time.time()):
             log.info("The access token for the user %s has expired. We're requesting a new one; please wait a moment.",
                      user)
 
             if self.__oauth_refresh_access_token(token_information["refresh_token"]):
-                log.info("The access token for the user %s has been refreshed. Please restart the application.",
-                         user)
+                log.info("The access token for the user %s has been refreshed. Please restart the application.", user)
 
-        headers['Authorization'] = 'Bearer ' + token_information['access_token']
+    def _user_used_for_authentication(self, user=None):
+        if user is None:
+            user = self._get_first_authenticated_user()
+        elif not self._user_is_authenticated(user):
+            log.error('The user %s you specified to use for authentication is not authenticated yet. ' +
+                      'Authenticate the user first, before you use it to retrieve lists.', user)
+
+            exit()
+
+        return user
+
+    def _headers_without_authentication(self):
+        return {
+            'Content-Type': 'application/json',
+            'trakt-api-version': '2',
+            'trakt-api-key': self.cfg.trakt.client_id
+        }
+
+    def _headers(self, user=None):
+        headers = self._headers_without_authentication()
+
+        user = self._user_used_for_authentication(user)
+
+        if user is not None:
+            self._renew_oauth_token_if_expired(user)
+            headers['Authorization'] = 'Bearer ' + self.cfg['trakt'][user]['access_token']
+        else:
+            log.info('No user')
 
         return headers, user
 
@@ -206,769 +372,230 @@ class Trakt:
     # Shows
     ############################################################
 
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
     def get_show(self, show_id):
-        try:
-            # generate payload
-            payload = {'extended': 'full'}
+        return self._make_item_request(
+            url='https://api.trakt.tv/shows/%s' % str(show_id),
+            object_name='show',
+        )
 
-            # make request
-            req = requests.get(
-                'https://api.trakt.tv/shows/%s' % str(show_id),
-                headers=self.headers,
-                params=payload,
-                timeout=30
-            )
-            log.debug("Request URL: %s", req.url)
-            log.debug("Request Payload: %s", payload)
-            log.debug("Response Code: %d", req.status_code)
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_trending_shows(self, limit=1000, languages=None, genres=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/shows/trending',
+            limit=limit,
+            languages=languages,
+            object_name='shows',
+            type_name='trending',
+            genres=genres
+        )
 
-            if req.status_code == 200:
-                resp_json = req.json()
-                return resp_json
-            else:
-                log.error("Failed to retrieve show, request response: %d", req.status_code)
-                return None
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_popular_shows(self, limit=1000, languages=None, genres=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/shows/popular',
+            limit=limit,
+            languages=languages,
+            object_name='shows',
+            type_name='popular',
+            genres=genres
+        )
 
-        except Exception:
-            log.exception("Exception retrieving show: ")
-        return None
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_anticipated_shows(self, limit=1000, languages=None, genres=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/shows/anticipated',
+            limit=limit,
+            languages=languages,
+            object_name='shows',
+            type_name='anticipated',
+            genres=genres
+        )
 
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
-    def get_anticipated_shows(self, limit=1000, languages=None):
-        try:
-            processed_shows = []
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_person_shows(self, person, limit=1000, languages=None, genres=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/people/%s/shows' % person,
+            limit=limit,
+            languages=languages,
+            object_name='shows',
+            type_name='person',
+            genres=genres
+        )
 
-            if languages is None:
-                languages = ['en']
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_most_played_shows(self, limit=1000, languages=None, genres=None, most_type=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/shows/played/%s' % ('weekly' if not most_type else most_type),
+            limit=limit,
+            languages=languages,
+            object_name='shows',
+            type_name='played',
+            genres=genres
+        )
 
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_most_watched_shows(self, limit=1000, languages=None, genres=None, most_type=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/shows/watched/%s' % ('weekly' if not most_type else most_type),
+            limit=limit,
+            languages=languages,
+            object_name='shows',
+            type_name='watched',
+            genres=genres
+        )
 
-            # make request
-            while True:
-                req = requests.get(
-                    'https://api.trakt.tv/shows/anticipated',
-                    headers=self.headers,
-                    params=payload,
-                    timeout=30
-                )
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_recommended_shows(self, authenticate_user=None, limit=1000, languages=None, genres=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/recommendations/shows',
+            authenticate_user=authenticate_user,
+            limit=limit,
+            languages=languages,
+            object_name='shows',
+            type_name='recommended from {authenticate_user}',
+            genres=genres
+        )
 
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    for show in resp_json:
-                        if show not in processed_shows:
-                            processed_shows.append(show)
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-
-                else:
-                    log.error("Failed to retrieve anticipated shows, request response: %d", req.status_code)
-                    break
-
-            if len(processed_shows):
-                log.debug("Found %d anticipated shows", len(processed_shows))
-                return processed_shows
-            return None
-        except Exception:
-            log.exception("Exception retrieving anticipated shows: ")
-        return None
-
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
     def get_watchlist_shows(self, authenticate_user=None, limit=1000, languages=None):
-        try:
-            processed_shows = []
+        return self._make_items_request(
+            url='https://api.trakt.tv/users/{authenticate_user}/watchlist/shows',
+            authenticate_user=authenticate_user,
+            limit=limit,
+            languages=languages,
+            object_name='shows',
+            type_name='watchlist from {authenticate_user}',
+        )
 
-            if languages is None:
-                languages = ['en']
-
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
-
-            # make request
-            while True:
-                headers, authenticate_user = self.oauth_headers(authenticate_user)
-
-                req = requests.get('https://api.trakt.tv/users/' + authenticate_user + '/watchlist/movies',
-                                   params=payload,
-                                   headers=headers,
-                                   timeout=30)
-                log.debug("Request User: %s", authenticate_user)
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
-
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    for show in resp_json:
-                        if show not in processed_shows:
-                            processed_shows.append(show)
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-                elif req.status_code == 401:
-                    log.error("The authentication to Trakt is revoked. Please re-authenticate.")
-
-                    exit()
-                else:
-                    log.error("Failed to retrieve shows on watchlist from %s, request response: %d", authenticate_user,
-                              req.status_code)
-                    break
-
-            if len(processed_shows):
-                log.debug("Found %d shows on watchlist from %s", len(processed_shows), authenticate_user)
-
-                return processed_shows
-            return None
-        except Exception:
-            log.exception("Exception retrieving shows on watchlist")
-        return None
-
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
     def get_user_list_shows(self, list_url, authenticate_user=None, limit=1000, languages=None):
-        try:
-            processed_shows = []
+        list_user, list_key = extract_list_user_and_key_from_url(list_url)
 
-            if languages is None:
-                languages = ['en']
+        log.debug('Fetching %s from %s', list_key, list_user)
 
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
-
-            try:
-                import re
-                list_user = re.search('\/users\/([^/]*)', list_url).group(1)
-                list_key = re.search('\/lists\/([^/]*)', list_url).group(1)
-            except:
-                log.error('The URL "%s" is not in the correct format', list_url)
-
-                exit()
-
-            log.debug('Fetching %s from %s', list_key, list_user)
-
-            # make request
-            while True:
-                headers, authenticate_user = self.oauth_headers(authenticate_user)
-
-                req = requests.get('https://api.trakt.tv/users/' + list_user + '/lists/' + list_key + '/items/shows',
-                                   params=payload,
-                                   headers=headers,
-                                   timeout=30)
-                log.debug("Request User: %s", authenticate_user)
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
-
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    for show in resp_json:
-                        if show not in processed_shows:
-                            processed_shows.append(show)
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-                elif req.status_code == 401:
-                    log.error("The authentication to Trakt is revoked. Please re-authenticate.")
-
-                    exit()
-                else:
-                    log.error("Failed to retrieve shows on %s from %s, request response: %d", list_key, list_user,
-                              req.status_code)
-                    break
-
-            if len(processed_shows):
-                log.debug("Found %d shows on %s from %s", len(processed_shows), list_key, list_user)
-
-                return processed_shows
-            return None
-        except Exception:
-            log.exception("Exception retrieving shows on user list")
-        return None
-
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
-    def get_trending_shows(self, limit=1000, languages=None):
-        try:
-            processed_shows = []
-
-            if languages is None:
-                languages = ['en']
-
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
-
-            # make request
-            while True:
-                req = requests.get(
-                    'https://api.trakt.tv/shows/trending',
-                    headers=self.headers,
-                    params=payload,
-                    timeout=30
-                )
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
-
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    for show in resp_json:
-                        if show not in processed_shows:
-                            processed_shows.append(show)
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-
-                else:
-                    log.error("Failed to retrieve trending shows, request response: %d", req.status_code)
-                    break
-
-            if len(processed_shows):
-                log.debug("Found %d trending shows", len(processed_shows))
-                return processed_shows
-            return None
-        except Exception:
-            log.exception("Exception retrieving trending shows: ")
-        return None
-
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
-    def get_popular_shows(self, limit=1000, languages=None):
-        try:
-            processed_shows = []
-
-            if languages is None:
-                languages = ['en']
-
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
-
-            # make request
-            while True:
-                req = requests.get(
-                    'https://api.trakt.tv/shows/popular',
-                    headers=self.headers,
-                    params=payload,
-                    timeout=30
-                )
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
-
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    # process list so it conforms to standard we expect ( e.g. {"show": {.....}} )
-                    for show in resp_json:
-                        if show not in processed_shows:
-                            processed_shows.append({'show': show})
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-
-                else:
-                    log.error("Failed to retrieve popular shows, request response: %d", req.status_code)
-                    break
-
-            if len(processed_shows):
-                log.debug("Found %d popular shows", len(processed_shows))
-                return processed_shows
-            return None
-        except Exception:
-            log.exception("Exception retrieving popular shows: ")
-        return None
+        return self._make_items_request(
+            url='https://api.trakt.tv/users/' + list_user + '/lists/' + list_key + '/items/shows',
+            authenticate_user=authenticate_user,
+            limit=limit,
+            languages=languages,
+            object_name='shows',
+            type_name=(list_key + ' from ' + list_user),
+        )
 
     ############################################################
     # Movies
     ############################################################
 
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
     def get_movie(self, movie_id):
-        try:
-            # generate payload
-            payload = {'extended': 'full'}
+        return self._make_item_request(
+            url='https://api.trakt.tv/movies/%s' % str(movie_id),
+            object_name='movie',
+        )
 
-            # make request
-            req = requests.get(
-                'https://api.trakt.tv/movies/%s' % str(movie_id),
-                headers=self.headers,
-                params=payload,
-                timeout=30
-            )
-            log.debug("Request URL: %s", req.url)
-            log.debug("Request Payload: %s", payload)
-            log.debug("Response Code: %d", req.status_code)
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_trending_movies(self, limit=1000, languages=None, genres=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/movies/trending',
+            limit=limit,
+            languages=languages,
+            object_name='movies',
+            type_name='trending',
+            genres=genres
+        )
 
-            if req.status_code == 200:
-                resp_json = req.json()
-                return resp_json
-            else:
-                log.error("Failed to retrieve movie, request response: %d", req.status_code)
-                return None
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_popular_movies(self, limit=1000, languages=None, genres=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/movies/popular',
+            limit=limit,
+            languages=languages,
+            object_name='movies',
+            type_name='popular',
+            genres=genres
+        )
 
-        except Exception:
-            log.exception("Exception retrieving movie: ")
-        return None
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_anticipated_movies(self, limit=1000, languages=None, genres=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/movies/anticipated',
+            limit=limit,
+            languages=languages,
+            object_name='movies',
+            type_name='anticipated',
+            genres=genres
+        )
 
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
-    def get_anticipated_movies(self, limit=1000, languages=None):
-        try:
-            processed_movies = []
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_person_movies(self, person, limit=1000, languages=None, genres=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/people/%s/movies' % person,
+            limit=limit,
+            languages=languages,
+            object_name='movies',
+            type_name='person',
+            genres=genres
+        )
 
-            if languages is None:
-                languages = ['en']
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_most_played_movies(self, limit=1000, languages=None, genres=None, most_type=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/movies/played/%s' % ('weekly' if not most_type else most_type),
+            limit=limit,
+            languages=languages,
+            object_name='movies',
+            type_name='played',
+            genres=genres
+        )
 
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
+    @cache(cache_file='cache.db', retry_if_blank=True)
+    def get_most_watched_movies(self, limit=1000, languages=None, genres=None, most_type=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/movies/watched/%s' % ('weekly' if not most_type else most_type),
+            limit=limit,
+            languages=languages,
+            object_name='movies',
+            type_name='watched',
+            genres=genres
+        )
 
-            # make request
-            while True:
-                req = requests.get(
-                    'https://api.trakt.tv/movies/anticipated',
-                    headers=self.headers,
-                    params=payload,
-                    timeout=30
-                )
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
-
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    for movie in resp_json:
-                        if movie not in processed_movies:
-                            processed_movies.append(movie)
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-
-                else:
-                    log.error("Failed to retrieve anticipated movies, request response: %d", req.status_code)
-                    break
-
-            if len(processed_movies):
-                log.debug("Found %d anticipated movies", len(processed_movies))
-                return processed_movies
-            return None
-        except Exception:
-            log.exception("Exception retrieving anticipated movies: ")
-        return None
-
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
-    def get_trending_movies(self, limit=1000, languages=None):
-        try:
-            processed_movies = []
-
-            if languages is None:
-                languages = ['en']
-
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
-
-            # make request
-            while True:
-                req = requests.get(
-                    'https://api.trakt.tv/movies/trending',
-                    headers=self.headers,
-                    params=payload,
-                    timeout=30
-                )
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
-
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    for movie in resp_json:
-                        if movie not in processed_movies:
-                            processed_movies.append(movie)
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-
-                else:
-                    log.error("Failed to retrieve trending movies, request response: %d", req.status_code)
-                    break
-
-            if len(processed_movies):
-                log.debug("Found %d trending movies", len(processed_movies))
-                return processed_movies
-            return None
-        except Exception:
-            log.exception("Exception retrieving trending movies: ")
-        return None
-
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
-    def get_popular_movies(self, limit=1000, languages=None):
-        try:
-            processed_movies = []
-
-            if languages is None:
-                languages = ['en']
-
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
-
-            # make request
-            while True:
-                req = requests.get(
-                    'https://api.trakt.tv/movies/popular',
-                    headers=self.headers,
-                    params=payload,
-                    timeout=30
-                )
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
-
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    # process list so it conforms to standard we expect ( e.g. {"movie": {.....}} )
-                    for movie in resp_json:
-                        if movie not in processed_movies:
-                            processed_movies.append({'movie': movie})
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-
-                else:
-                    log.error("Failed to retrieve popular movies, request response: %d", req.status_code)
-                    break
-
-            if len(processed_movies):
-                log.debug("Found %d popular movies", len(processed_movies))
-                return processed_movies
-            return None
-        except Exception:
-            log.exception("Exception retrieving popular movies: ")
-        return None
-
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
     def get_boxoffice_movies(self, limit=1000, languages=None):
-        try:
-            processed_movies = []
+        return self._make_items_request(
+            url='https://api.trakt.tv/movies/boxoffice',
+            limit=limit,
+            languages=languages,
+            object_name='movies',
+            type_name='anticipated',
+        )
 
-            if languages is None:
-                languages = ['en']
+    def get_recommended_movies(self, authenticate_user=None, limit=1000, languages=None, genres=None):
+        return self._make_items_request(
+            url='https://api.trakt.tv/recommendations/movies',
+            authenticate_user=authenticate_user,
+            limit=limit,
+            languages=languages,
+            object_name='movies',
+            type_name='recommended from {authenticate_user}',
+            genres=genres
+        )
 
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
-
-            # make request
-            while True:
-                req = requests.get(
-                    'https://api.trakt.tv/movies/boxoffice',
-                    headers=self.headers,
-                    params=payload,
-                    timeout=30
-                )
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
-
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    for movie in resp_json:
-                        if movie not in processed_movies:
-                            processed_movies.append(movie)
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-
-                else:
-                    log.error("Failed to retrieve boxoffice movies, request response: %d", req.status_code)
-                    break
-
-            if len(processed_movies):
-                log.debug("Found %d boxoffice movies", len(processed_movies))
-                return processed_movies
-            return None
-        except Exception:
-            log.exception("Exception retrieving boxoffice movies: ")
-        return None
-
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
     def get_watchlist_movies(self, authenticate_user=None, limit=1000, languages=None):
-        try:
-            processed_movies = []
+        return self._make_items_request(
+            url='https://api.trakt.tv/users/{authenticate_user}/watchlist/movies',
+            authenticate_user=authenticate_user,
+            limit=limit,
+            languages=languages,
+            object_name='movies',
+            type_name='watchlist from {authenticate_user}',
+        )
 
-            if languages is None:
-                languages = ['en']
-
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
-
-            # make request
-            while True:
-                headers, authenticate_user = self.oauth_headers(authenticate_user)
-
-                req = requests.get('https://api.trakt.tv/users/' + authenticate_user + '/watchlist/movies',
-                                   params=payload,
-                                   headers=headers,
-                                   timeout=30)
-                log.debug("Request User: %s", authenticate_user)
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
-
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    for show in resp_json:
-                        if show not in processed_movies:
-                            processed_movies.append(show)
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-                elif req.status_code == 401:
-                    log.error("The authentication to Trakt is revoked. Please re-authenticate.")
-
-                    exit()
-                else:
-                    log.error("Failed to retrieve movies on watchlist from %s, request response: %d", authenticate_user,
-                              req.status_code)
-                    break
-
-            if len(processed_movies):
-                log.debug("Found %d movies on watchlist from %s", len(processed_movies), authenticate_user)
-
-                return processed_movies
-            return None
-        except Exception:
-            log.exception("Exception retrieving movies on watchlist")
-        return None
-
-    @backoff.on_predicate(backoff.expo, lambda x: x is None, max_tries=4, on_backoff=backoff_handler)
     def get_user_list_movies(self, list_url, authenticate_user=None, limit=1000, languages=None):
-        try:
-            processed_movies = []
+        list_user, list_key = extract_list_user_and_key_from_url(list_url)
 
-            if languages is None:
-                languages = ['en']
+        log.debug('Fetching %s from %s', list_key, list_user)
 
-            # generate payload
-            payload = {'extended': 'full', 'limit': limit, 'page': 1}
-            if languages:
-                payload['languages'] = ','.join(languages)
-
-            try:
-                import re
-                list_user = re.search('\/users\/([^/]*)', list_url).group(1)
-                list_key = re.search('\/lists\/([^/]*)', list_url).group(1)
-            except:
-                log.error('The URL "%s" is not in the correct format', list_url)
-
-            log.debug('Fetching %s from %s', list_key, list_user)
-
-            # make request
-            while True:
-                headers, authenticate_user = self.oauth_headers(authenticate_user)
-
-                req = requests.get('https://api.trakt.tv/users/' + list_user + '/lists/' + list_key + '/items/movies',
-                                   params=payload,
-                                   headers=headers,
-                                   timeout=30)
-                log.debug("Request User: %s", authenticate_user)
-                log.debug("Request URL: %s", req.url)
-                log.debug("Request Payload: %s", payload)
-                log.debug("Response Code: %d", req.status_code)
-                log.debug("Response Page: %d of %d", payload['page'],
-                          0 if 'X-Pagination-Page-Count' not in req.headers else int(
-                              req.headers['X-Pagination-Page-Count']))
-
-                if req.status_code == 200:
-                    resp_json = req.json()
-
-                    for show in resp_json:
-                        if show not in processed_movies:
-                            processed_movies.append(show)
-
-                    # check if we have fetched the last page, break if so
-                    if 'X-Pagination-Page-Count' not in req.headers or not int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There was no more pages to retrieve")
-                        break
-                    elif payload['page'] >= int(req.headers['X-Pagination-Page-Count']):
-                        log.debug("There are no more pages to retrieve results from")
-                        break
-                    else:
-                        log.info("There are %d pages left to retrieve results from",
-                                 int(req.headers['X-Pagination-Page-Count']) - payload['page'])
-                        payload['page'] += 1
-                        time.sleep(5)
-                elif req.status_code == 401:
-                    log.error("The authentication to Trakt is revoked. Please re-authenticate.")
-
-                    exit()
-                else:
-                    log.error("Failed to retrieve movies on %s from %s, request response: %d", list_key,
-                              authenticate_user,
-                              req.status_code)
-                    break
-
-            if len(processed_movies):
-                log.debug("Found %d movies on %s from %s", len(processed_movies), list_key, authenticate_user)
-
-                return processed_movies
-            return None
-        except Exception:
-            log.exception("Exception retrieving movies on user list")
-        return None
+        return self._make_items_request(
+            url='https://api.trakt.tv/users/' + list_user + '/lists/' + list_key + '/items/movies',
+            authenticate_user=authenticate_user,
+            limit=limit,
+            languages=languages,
+            object_name='movies',
+            type_name=(list_key + ' from ' + list_user),
+        )

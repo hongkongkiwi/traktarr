@@ -55,24 +55,32 @@ class Config(object, metaclass=Singleton):
             'profile': 'HD-1080p',
             'root_folder': '/movies/'
         },
+        'omdb': {
+            'api_key': ''
+        },
         'filters': {
             'shows': {
+                'disabled_for': [],
                 'blacklisted_genres': [],
                 'blacklisted_networks': [],
                 'allowed_countries': [],
+                'allowed_languages': [],
                 'blacklisted_min_runtime': 15,
                 'blacklisted_min_year': 2000,
                 'blacklisted_max_year': 2019,
                 'blacklisted_tvdb_ids': [],
             },
             'movies': {
+                'disabled_for': [],
                 'blacklisted_genres': [],
                 'blacklisted_min_runtime': 60,
                 'blacklisted_min_year': 2000,
                 'blacklisted_max_year': 2019,
                 'blacklist_title_keywords': [],
                 'blacklisted_tmdb_ids': [],
-                'allowed_countries': []
+                'allowed_countries': [],
+                'allowed_languages': [],
+                'rating_limit':""
             }
         },
         'automatic': {
@@ -153,11 +161,6 @@ class Config(object, metaclass=Singleton):
     def __inner_upgrade(self, settings1, settings2, key=None, overwrite=False):
         sub_upgraded = False
         merged = settings2.copy()
-
-        # print(settings1)
-        # print(settings2)
-        # print(overwrite)
-        # print("_______________")
 
         if isinstance(settings1, dict):
             for k, v in settings1.items():
